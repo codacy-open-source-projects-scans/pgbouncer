@@ -497,6 +497,7 @@ PgUser *add_user(const char *name, const char *passwd)
 
 		aatree_insert(&user_tree, (uintptr_t)user->name, &user->tree_node);
 		user->pool_mode = POOL_INHERIT;
+		user->pool_size = -1;
 	}
 	safe_strcpy(user->passwd, passwd, sizeof(user->passwd));
 	return user;
@@ -522,6 +523,7 @@ PgUser *add_db_user(PgDatabase *db, const char *name, const char *passwd)
 
 		aatree_insert(&db->user_tree, (uintptr_t)user->name, &user->tree_node);
 		user->pool_mode = POOL_INHERIT;
+		user->pool_size = -1;
 	}
 	safe_strcpy(user->passwd, passwd, sizeof(user->passwd));
 	return user;
@@ -547,6 +549,7 @@ PgUser *add_pam_user(const char *name, const char *passwd)
 
 		aatree_insert(&pam_user_tree, (uintptr_t)user->name, &user->tree_node);
 		user->pool_mode = POOL_INHERIT;
+		user->pool_size = -1;
 	}
 	if (passwd)
 		safe_strcpy(user->passwd, passwd, sizeof(user->passwd));
@@ -564,6 +567,7 @@ PgUser *force_user(PgDatabase *db, const char *name, const char *passwd)
 		list_init(&user->head);
 		list_init(&user->pool_list);
 		user->pool_mode = POOL_INHERIT;
+		user->pool_size = -1;
 	}
 	safe_strcpy(user->name, name, sizeof(user->name));
 	safe_strcpy(user->passwd, passwd, sizeof(user->passwd));
@@ -1071,8 +1075,9 @@ bool life_over(PgSocket *server)
 	usec_t now = get_cached_time();
 	usec_t age = now - server->connect_time;
 	usec_t last_kill = now - pool->last_lifetime_disconnect;
+	usec_t server_lifetime = pool_server_lifetime(pool);
 
-	if (age < cf_server_lifetime)
+	if (age < server_lifetime)
 		return false;
 
 	/*
@@ -1081,7 +1086,7 @@ bool life_over(PgSocket *server)
 	 * of connections together.
 	 */
 	if (pool_pool_size(pool) > 0)
-		lifetime_kill_gap = cf_server_lifetime / pool_pool_size(pool);
+		lifetime_kill_gap = server_lifetime / pool_pool_size(pool);
 
 	if (last_kill >= lifetime_kill_gap)
 		return true;
