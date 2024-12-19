@@ -500,39 +500,34 @@ PgDatabase *register_auto_database(const char *name)
 	return db;
 }
 
-/* add or update client users */
-PgGlobalUser *add_global_user(const char *name, const char *passwd)
+PgGlobalUser *update_global_user_passwd(PgGlobalUser *user, const char *passwd)
 {
-	PgGlobalUser *user = find_global_user(name);
-
-	if (user == NULL) {
-		user = slab_alloc(user_cache);
-		if (!user)
-			return NULL;
-		user->credentials.global_user = user;
-
-		list_init(&user->head);
-		list_init(&user->pool_list);
-		safe_strcpy(user->credentials.name, name, sizeof(user->credentials.name));
-		put_in_order(&user->head, &user_list, cmp_user);
-
-		aatree_insert(&user_tree, (uintptr_t)user->credentials.name, &user->credentials.tree_node);
-		user->pool_mode = POOL_INHERIT;
-		user->pool_size = -1;
-	}
-
+	Assert(user);
 	passwd = passwd ? passwd : "";
 	safe_strcpy(user->credentials.passwd, passwd, sizeof(user->credentials.passwd));
 	user->credentials.dynamic_passwd = strlen(passwd) == 0;
 	return user;
 }
 
-PgCredentials *add_global_credentials(const char *name, const char *passwd)
+static PgGlobalUser *add_new_global_user(const char *name, const char *passwd)
 {
-	PgGlobalUser *user = add_global_user(name, passwd);
+	PgGlobalUser *user = slab_alloc(user_cache);
+
 	if (!user)
 		return NULL;
-	return &user->credentials;
+
+	user->credentials.global_user = user;
+
+	list_init(&user->head);
+	list_init(&user->pool_list);
+	safe_strcpy(user->credentials.name, name, sizeof(user->credentials.name));
+	put_in_order(&user->head, &user_list, cmp_user);
+
+	aatree_insert(&user_tree, (uintptr_t)user->credentials.name, &user->credentials.tree_node);
+	user->pool_mode = POOL_INHERIT;
+	user->pool_size = -1;
+
+	return update_global_user_passwd(user, passwd);
 }
 
 /*
@@ -558,11 +553,13 @@ PgCredentials *add_dynamic_credentials(PgDatabase *db, const char *name, const c
 
 		safe_strcpy(credentials->name, name, sizeof(credentials->name));
 
-		aatree_insert(&db->user_tree, (uintptr_t)credentials->name, &credentials->tree_node);
-		credentials->global_user = find_global_user(name);
+		credentials->global_user = find_or_add_new_global_user(name, NULL);
 		if (!credentials->global_user) {
-			credentials->global_user = add_global_user(name, NULL);
+			slab_free(credentials_cache, credentials);
+			return NULL;
 		}
+
+		aatree_insert(&db->user_tree, (uintptr_t)credentials->name, &credentials->tree_node);
 	}
 
 	safe_strcpy(credentials->passwd, passwd, sizeof(credentials->passwd));
@@ -587,11 +584,13 @@ PgCredentials *add_pam_credentials(const char *name, const char *passwd)
 
 		safe_strcpy(credentials->name, name, sizeof(credentials->name));
 
-		aatree_insert(&pam_user_tree, (uintptr_t)credentials->name, &credentials->tree_node);
-		credentials->global_user = find_global_user(name);
+		credentials->global_user = find_or_add_new_global_user(name, NULL);
 		if (!credentials->global_user) {
-			credentials->global_user = add_global_user(name, NULL);
+			slab_free(credentials_cache, credentials);
+			return NULL;
 		}
+
+		aatree_insert(&pam_user_tree, (uintptr_t)credentials->name, &credentials->tree_node);
 	}
 	if (passwd)
 		safe_strcpy(credentials->passwd, passwd, sizeof(credentials->passwd));
@@ -607,9 +606,10 @@ PgCredentials *force_user_credentials(PgDatabase *db, const char *name, const ch
 		if (!credentials)
 			return NULL;
 
-		credentials->global_user = find_global_user(name);
+		credentials->global_user = find_or_add_new_global_user(name, NULL);
 		if (!credentials->global_user) {
-			credentials->global_user = add_global_user(name, NULL);
+			slab_free(credentials_cache, credentials);
+			return NULL;
 		}
 	}
 	safe_strcpy(credentials->name, name, sizeof(credentials->name));
@@ -873,7 +873,7 @@ bool check_fast_fail(PgSocket *client)
 		return true;
 
 	/* Else we fail the client. */
-	disconnect_client(client, true, "server login has been failing, try again later (server_login_retry)");
+	disconnect_client(client, true, "server login has been failing, cached error: %s (server_login_retry)", pool->last_connect_failed_message);
 
 	/*
 	 * Try to launch a new connection.  (launch_new_connection()
@@ -907,7 +907,7 @@ bool find_server(PgSocket *client)
 	/* try to get idle server, if allowed */
 	if (cf_pause_mode == P_PAUSE || pool->db->db_paused) {
 		server = NULL;
-	} else if (client->replication) {
+	} else if (client->replication && !sending_auth_query(client)) {
 		/*
 		 * For replication clients we open dedicated server connections. These
 		 * connections are linked to a client as soon as the server is ready,
@@ -979,7 +979,7 @@ static bool reuse_on_release(PgSocket *server)
 	Assert(!server->replication);
 	slog_debug(server, "reuse_on_release: replication %d", server->replication);
 	client = first_socket(&pool->waiting_client_list);
-	if (client && !client->replication) {
+	if (client && (!client->replication || sending_auth_query(client))) {
 		activate_client(client);
 
 		/*
@@ -999,16 +999,38 @@ bool queue_fake_response(PgSocket *client, char request_type)
 	PgSocket *server = client->link;
 	Assert(server);
 
-	if (request_type == 'P') {
+	if (request_type == PqMsg_Parse) {
 		slog_debug(client, "Queuing fake ParseComplete packet");
 		QUEUE_ParseComplete(res, server, client);
-	} else if (request_type == 'C') {
+	} else if (request_type == PqMsg_Close) {
 		slog_debug(client, "Queuing fake CloseComplete packet");
 		QUEUE_CloseComplete(res, server, client);
 	} else {
 		fatal("Unknown fake request type %c", request_type);
 	}
 	return res;
+}
+
+/* Find an existing global user or add a new global user */
+PgGlobalUser *find_or_add_new_global_user(const char *name, const char *passwd)
+{
+	PgGlobalUser *user = find_global_user(name);
+
+	if (!user)
+		user = add_new_global_user(name, passwd);
+
+	return user;
+}
+
+/* Find an existing global credentials or add a new global credentials */
+PgCredentials *find_or_add_new_global_credentials(const char *name, const char *passwd)
+{
+	PgGlobalUser *user = find_or_add_new_global_user(name, passwd);
+
+	if (!user)
+		return NULL;
+
+	return &user->credentials;
 }
 
 /*
@@ -1055,7 +1077,7 @@ bool add_outstanding_request(PgSocket *client, char type, ResponseAction action)
  *
  * returns true if one of the given types was popped of off the queue.
  */
-bool pop_outstanding_request(PgSocket *server, char *types, bool *skip)
+bool pop_outstanding_request(PgSocket *server, const char types[], bool *skip)
 {
 	OutstandingRequest *request;
 	struct List *item = statlist_first(&server->outstanding_requests);
@@ -1092,19 +1114,19 @@ bool pop_outstanding_request(PgSocket *server, char *types, bool *skip)
  * types in "types". Any Parse or Close statement requests that were still
  * outstanding will be unregistered or re-registered from the server its cache.
  */
-bool clear_outstanding_requests_until(PgSocket *server, char *types)
+bool clear_outstanding_requests_until(PgSocket *server, const char types[])
 {
 	struct List *item, *tmp;
 	statlist_for_each_safe(item, &server->outstanding_requests, tmp) {
 		OutstandingRequest *request = container_of(item, OutstandingRequest, node);
 		char type = request->type;
-		if (type == 'P' && request->server_ps_query_id > 0) {
+		if (type == PqMsg_Parse && request->server_ps_query_id > 0) {
 			unregister_prepared_statement(server, request->server_ps_query_id);
 			slog_noise(server,
 				   "failed prepared statement '" PREPARED_STMT_NAME_FORMAT "' removed from server cache, %d cached items",
 				   request->server_ps_query_id,
 				   HASH_COUNT(server->server_prepared_statements));
-		} else if (type == 'C' && request->server_ps != NULL) {
+		} else if (type == PqMsg_Close && request->server_ps != NULL) {
 			if (!add_prepared_statement(server, request->server_ps)) {
 				if (server->link)
 					disconnect_client(server->link, true, "out of memory");
@@ -1134,7 +1156,7 @@ static bool reset_on_release(PgSocket *server)
 	Assert(server->state == SV_TESTED);
 
 	slog_debug(server, "resetting: %s", cf_server_reset_query);
-	SEND_generic(res, server, 'Q', "s", cf_server_reset_query);
+	SEND_generic(res, server, PqMsg_Query, "s", cf_server_reset_query);
 	if (!res)
 		disconnect_server(server, false, "reset query failed");
 	return res;
@@ -1346,6 +1368,7 @@ void disconnect_server(PgSocket *server, bool send_term, const char *reason, ...
 		if (!server->ready) {
 			server->pool->last_login_failed = true;
 			server->pool->last_connect_failed = true;
+			safe_strcpy(server->pool->last_connect_failed_message, reason, sizeof(server->pool->last_connect_failed_message));
 		} else
 		{
 			/*
@@ -1373,7 +1396,7 @@ void disconnect_server(PgSocket *server, bool send_term, const char *reason, ...
 
 	/* notify server and close connection */
 	if (send_term) {
-		static const uint8_t pkt_term[] = {'X', 0, 0, 0, 4};
+		static const uint8_t pkt_term[] = {PqMsg_Terminate, 0, 0, 0, 4};
 		bool _ignore = sbuf_answer(&server->sbuf, pkt_term, sizeof(pkt_term));
 		(void) _ignore;
 	}
@@ -1405,6 +1428,14 @@ void disconnect_server(PgSocket *server, bool send_term, const char *reason, ...
  */
 void disconnect_client(PgSocket *client, bool notify, const char *reason, ...)
 {
+	if (client->db && client->contributes_db_client_count)
+		client->db->client_connection_count--;
+
+	if (client->login_user_credentials) {
+		if (client->login_user_credentials->global_user && client->user_connection_counted) {
+			client->login_user_credentials->global_user->client_connection_count--;
+		}
+	}
 	if (reason) {
 		char buf[128];
 		va_list ap;
@@ -1640,6 +1671,9 @@ static void dns_connect(struct PgSocket *server)
 		int count = 1;
 		int n;
 
+		if (server->pool->db->load_balance_hosts == LOAD_BALANCE_HOSTS_DISABLE && server->pool->last_connect_failed)
+			server->pool->rrcounter++;
+
 		for (const char *p = db->host; *p; p++)
 			if (*p == ',')
 				count++;
@@ -1650,7 +1684,8 @@ static void dns_connect(struct PgSocket *server)
 				break;
 		Assert(host);
 
-		server->pool->rrcounter++;
+		if (server->pool->db->load_balance_hosts == LOAD_BALANCE_HOSTS_ROUND_ROBIN)
+			server->pool->rrcounter++;
 	} else {
 		host = db->host;
 	}
@@ -1873,7 +1908,7 @@ void launch_new_connection(PgPool *pool, bool evict_if_needed)
 			}
 		}
 
-		if (c && c->replication) {
+		if (c && c->replication && !sending_auth_query(c)) {
 			while (evict_if_needed && pool_pool_size(pool) >= max) {
 				if (!evict_pool_connection(pool))
 					break;
@@ -2157,11 +2192,17 @@ found:
 		return;
 	}
 
+	server = main_client->link;
+
+	if (server->setting_vars) {
+		disconnect_client(req, false, "ignoring cancel request for server that is setting vars");
+		return;
+	}
+
 	/*
 	 * Link the cancel request and the server on which the query is being
 	 * cancelled in a many-to-one way.
 	 */
-	server = main_client->link;
 	req->canceled_server = server;
 	statlist_append(&server->canceling_clients, &req->cancel_head);
 
@@ -2258,7 +2299,7 @@ bool use_client_socket(int fd, PgAddr *addr,
 			log_error("SCRAM key data received for forced user");
 			return false;
 		}
-		if (cf_auth_type == AUTH_PAM) {
+		if (cf_auth_type == AUTH_TYPE_PAM) {
 			log_error("SCRAM key data received for PAM user");
 			return false;
 		}
@@ -2325,7 +2366,7 @@ bool use_server_socket(int fd, PgAddr *addr,
 
 	if (db->forced_user_credentials) {
 		credentials = db->forced_user_credentials;
-	} else if (cf_auth_type == AUTH_PAM) {
+	} else if (cf_auth_type == AUTH_TYPE_PAM) {
 		credentials = add_pam_credentials(username, password);
 	} else {
 		credentials = find_global_credentials(username);
