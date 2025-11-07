@@ -337,6 +337,9 @@ bool parse_database(void *base, const char *name, const char *connstr)
 		} else if (strcmp("min_pool_size", key) == 0) {
 			min_pool_size = atoi(val);
 		} else if (strcmp("reserve_pool", key) == 0) {
+			/* We continue supporting this option for backwards compatibility */
+			res_pool_size = atoi(val);
+		} else if (strcmp("reserve_pool_size", key) == 0) {
 			res_pool_size = atoi(val);
 		} else if (strcmp("max_db_connections", key) == 0) {
 			max_db_connections = atoi(val);
@@ -499,8 +502,10 @@ bool parse_user(void *base, const char *name, const char *connstr)
 	struct CfValue cv;
 	int pool_mode = POOL_INHERIT;
 	int pool_size = -1;
+	int res_pool_size = -1;
 	int max_user_connections = -1;
 	usec_t idle_transaction_timeout = 0;
+	usec_t transaction_timeout = 0;
 	usec_t query_timeout = 0;
 	usec_t client_idle_timeout = 0;
 	int max_user_client_connections = -1;
@@ -531,8 +536,13 @@ bool parse_user(void *base, const char *name, const char *connstr)
 			}
 		} else if (strcmp("pool_size", key) == 0) {
 			pool_size = atoi(val);
+		} else if (strcmp("reserve_pool_size", key) == 0) {
+			res_pool_size = atoi(val);
 		} else if (strcmp("max_user_connections", key) == 0) {
 			max_user_connections = atoi(val);
+		} else if (strcmp("transaction_timeout", key) == 0) {
+			any_user_level_timeout_set = true;
+			transaction_timeout = atoi(val) * USEC;
 		} else if (strcmp("idle_transaction_timeout", key) == 0) {
 			any_user_level_timeout_set = true;
 			idle_transaction_timeout = atoi(val) * USEC;
@@ -558,8 +568,10 @@ bool parse_user(void *base, const char *name, const char *connstr)
 
 	user->pool_mode = pool_mode;
 	user->pool_size = pool_size;
+	user->res_pool_size = res_pool_size;
 	user->max_user_connections = max_user_connections;
 	user->idle_transaction_timeout = idle_transaction_timeout;
+	user->transaction_timeout = transaction_timeout;
 	user->query_timeout = query_timeout;
 	user->client_idle_timeout = client_idle_timeout;
 	user->max_user_client_connections = max_user_client_connections;
@@ -624,6 +636,13 @@ static void unquote_add_authfile_user(const char *username, const char *password
 	}
 
 	user->credentials.dynamic_passwd = false;
+
+	/* Clear cached adhoc scram secrets since the user may have changed the password. */
+	if (user->credentials.scram_SaltKey != NULL) {
+		free(user->credentials.scram_SaltKey);
+		user->credentials.scram_SaltKey = NULL;
+		user->credentials.adhoc_scram_secrets_cached = false;
+	}
 }
 
 static bool auth_loaded(const char *fn)

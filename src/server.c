@@ -310,10 +310,13 @@ int database_min_pool_size(PgDatabase *db)
 
 int pool_res_pool_size(PgPool *pool)
 {
-	if (pool->db->res_pool_size < 0)
-		return cf_res_pool_size;
-	else
+	int user_res_pool_size = pool->user_credentials ? pool->user_credentials->global_user->res_pool_size : -1;
+	if (user_res_pool_size >= 0)
+		return user_res_pool_size;
+	else if (pool->db->res_pool_size >= 0)
 		return pool->db->res_pool_size;
+	else
+		return cf_res_pool_size;
 }
 
 int database_max_client_connections(PgDatabase *db)
@@ -674,14 +677,7 @@ static bool handle_connect(PgSocket *server)
 	 */
 	if (!statlist_empty(&pool->waiting_cancel_req_list)) {
 		slog_debug(server, "use it for pending cancel req");
-		if (forward_cancel_request(server)) {
-			change_server_state(server, SV_ACTIVE_CANCEL);
-			sbuf_continue(&server->sbuf);
-		} else {
-			/* notify disconnect_server() that connect did not fail */
-			server->ready = true;
-			disconnect_server(server, false, "failed to send cancel req");
-		}
+		forward_cancel_request(server);
 	} else if (pool->db->peer_id) {
 		/* notify disconnect_server() that connect did not fail */
 		server->ready = true;
@@ -728,7 +724,7 @@ static bool handle_sslchar(PgSocket *server, struct MBuf *data)
 
 	if (schar == 'S') {
 		slog_noise(server, "launching tls");
-		ok = sbuf_tls_connect(&server->sbuf, server->pool->db->host);
+		ok = sbuf_tls_connect(&server->sbuf, server->host);
 	} else if (server_connect_sslmode >= SSLMODE_REQUIRE) {
 		disconnect_server(server, false, "server refused SSL");
 		return false;
